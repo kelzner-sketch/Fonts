@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Load local secrets when present. .env is ignored by git.
+if [ -f .env ]; then
+  set -a
+  source .env
+  set +a
+fi
+
 # APP_PORT is injected by the sandbox (3000-3099 range)
 # Vite dev server listens on APP_PORT so the sandbox proxy can reach it
 # FastAPI backend runs on an internal port, proxied by Vite
