@@ -36,8 +36,16 @@ This installs dependencies and starts both the Vite dev server (frontend) and th
 - Backend API: Add routes in `routes.py`
 - The Vite dev server proxies `/api` requests to the FastAPI backend
 
-Set `GEMINI_WORKSHOP_API_KEY` (and `GEMINI_WORKSHOP_BASE_URL` when required by
-the environment) before using analysis or generation.
+Set `GEMINI_API_KEY` to a key created in Google AI Studio before using analysis
+or generation. For local development, copy `.env.example` to `.env`, replace
+the placeholder, then run:
+
+```bash
+bash start.sh
+```
+
+`start.sh` loads `.env`, which is ignored by git. Legacy Workshop deployments can continue using
+`GEMINI_WORKSHOP_API_KEY` and `GEMINI_WORKSHOP_BASE_URL`.
 
 ## Reliability limits
 

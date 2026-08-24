@@ -14,18 +14,32 @@ import io
 _client = None
 
 
+def _client_options() -> dict:
+    """Build Gemini client options for standard API or legacy Workshop proxy."""
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+        "GEMINI_WORKSHOP_API_KEY"
+    )
+    if not api_key:
+        raise RuntimeError(
+            "Gemini is not configured. Set GEMINI_API_KEY in the server environment."
+        )
+
+    options = {"api_key": api_key}
+    base_url = os.environ.get("GEMINI_WORKSHOP_BASE_URL")
+    if base_url:
+        options["http_options"] = {
+            "api_version": "v1alpha",
+            "base_url": base_url,
+        }
+    return options
+
+
 def _get_client():
     global _client
     if _client is None:
         from google import genai
 
-        _client = genai.Client(
-            api_key=os.environ.get("GEMINI_WORKSHOP_API_KEY"),
-            http_options={
-                "api_version": "v1alpha",
-                "base_url": os.environ.get("GEMINI_WORKSHOP_BASE_URL"),
-            },
-        )
+        _client = genai.Client(**_client_options())
     return _client
 
 
