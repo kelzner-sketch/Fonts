@@ -3,6 +3,10 @@ import { Loader2, Upload } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { apiRequest } from "@/lib/api";
+
+const MAX_UPLOAD_BYTES = 12 * 1024 * 1024;
+const ACCEPTED_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 
 interface UploadStepProps {
   onAnalyzed: (file: File, objectUrl: string, data: AnalyzeResponse) => void;
@@ -17,8 +21,12 @@ export function UploadStep({ onAnalyzed }: UploadStepProps) {
   const handleFile = useCallback(
     async (file: File | undefined | null) => {
       if (!file) return;
-      if (!file.type.startsWith("image/")) {
-        setError("Please select an image file.");
+      if (!ACCEPTED_TYPES.has(file.type)) {
+        setError("Choose a PNG, JPG, or WebP image.");
+        return;
+      }
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError("That image is larger than 12 MB. Resize it and try again.");
         return;
       }
       setError(null);
@@ -27,15 +35,10 @@ export function UploadStep({ onAnalyzed }: UploadStepProps) {
       const formData = new FormData();
       formData.append("file", file);
       try {
-        const res = await fetch("/api/handwriting/analyze", {
+        const data = await apiRequest<AnalyzeResponse>("/api/handwriting/analyze", {
           method: "POST",
           body: formData,
-        });
-        if (!res.ok) {
-          const text = await res.text().catch(() => "");
-          throw new Error(text || `Analysis failed (${res.status})`);
-        }
-        const data = (await res.json()) as AnalyzeResponse;
+        }, 60_000);
         onAnalyzed(file, objectUrl, data);
       } catch (e) {
         URL.revokeObjectURL(objectUrl);
@@ -106,7 +109,7 @@ export function UploadStep({ onAnalyzed }: UploadStepProps) {
                     Click to upload or drag & drop
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    PNG, JPG, or other image formats
+                    PNG, JPG, or WebP · up to 12 MB
                   </p>
                 </div>
               </>
@@ -115,9 +118,12 @@ export function UploadStep({ onAnalyzed }: UploadStepProps) {
           <input
             ref={inputRef}
             type="file"
-            accept="image/*"
+            accept="image/png,image/jpeg,image/webp"
             className="hidden"
-            onChange={(e) => handleFile(e.target.files?.[0])}
+            onChange={(e) => {
+              handleFile(e.target.files?.[0]);
+              e.currentTarget.value = "";
+            }}
           />
           {error && (
             <p className="mt-3 text-center text-sm text-destructive">{error}</p>

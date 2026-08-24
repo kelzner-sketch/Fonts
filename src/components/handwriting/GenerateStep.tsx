@@ -16,12 +16,15 @@ import { useCallback, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
+import { apiRequest } from "@/lib/api";
 import {
   Alert,
   AlertDescription,
   AlertTitle,
 } from "@/components/ui/alert";
 import { CHARSET_CHARS, CHARSET_TOTAL } from "./charset";
+
+const GENERATION_BATCH_SIZE = 12;
 
 interface GenerateStepProps {
   sessionId: string;
@@ -39,6 +42,7 @@ export function GenerateStep({
   onFontBuilt,
 }: GenerateStepProps) {
   const [generating, setGenerating] = useState(false);
+  const [generationProgress, setGenerationProgress] = useState({ done: 0, total: 0 });
   const [errors, setErrors] = useState<{ char: string; error: string }[]>([]);
   const [regeneratingChar, setRegeneratingChar] = useState<string | null>(null);
   const [building, setBuilding] = useState(false);
@@ -50,38 +54,41 @@ export function GenerateStep({
   const captured = target.filter((c) => haveChars.has(c)).length;
   const missingCount = total - captured;
 
-  const setGallery = (updater: (prev: GalleryGlyph[]) => GalleryGlyph[]) => {
-    onGalleryChange(updater(gallery));
-  };
-
   const handleGenerateMissing = async () => {
     setGenerating(true);
     setErrors([]);
+    const missing = target.filter((char) => !haveChars.has(char));
+    setGenerationProgress({ done: 0, total: missing.length });
     try {
-      const existingChars = gallery.map((g) => g.char);
-      const res = await fetch("/api/handwriting/generate-missing", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          existing_chars: existingChars,
-          charset,
-        }),
-      });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(t || `Generation failed (${res.status})`);
+      let currentGallery = gallery;
+      for (let offset = 0; offset < missing.length; offset += GENERATION_BATCH_SIZE) {
+        const batch = missing.slice(offset, offset + GENERATION_BATCH_SIZE);
+        const data = await apiRequest<GenerateMissingResponse>(
+          "/api/handwriting/generate-missing",
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: sessionId,
+              existing_chars: currentGallery.map((g) => g.char),
+              requested_chars: batch,
+              charset,
+            }),
+          },
+          120_000,
+        );
+        const byChar = new Map(currentGallery.map((g) => [g.char, g]));
+        for (const glyph of data.generated) {
+          byChar.set(glyph.char, { ...glyph, source: "generated" as const });
+        }
+        currentGallery = Array.from(byChar.values());
+        onGalleryChange(currentGallery);
+        if (data.errors.length) setErrors((previous) => [...previous, ...data.errors]);
+        setGenerationProgress({
+          done: Math.min(offset + batch.length, missing.length),
+          total: missing.length,
+        });
       }
-      const data = (await res.json()) as GenerateMissingResponse;
-      const generated: GalleryGlyph[] = data.generated.map((g) => ({
-        ...g,
-        source: "generated" as const,
-      }));
-      // merge: replace if same char exists, else append
-      const byChar = new Map(gallery.map((g) => [g.char, g]));
-      for (const g of generated) byChar.set(g.char, g);
-      onGalleryChange(Array.from(byChar.values()));
-      if (data.errors.length) setErrors(data.errors);
     } catch (e) {
       setErrors([
         {
@@ -101,7 +108,7 @@ export function GenerateStep({
         const existingChars = gallery
           .filter((g) => g.char !== char)
           .map((g) => g.char);
-        const res = await fetch("/api/handwriting/regenerate-glyph", {
+        const data = await apiRequest<RegenerateGlyphResponse>("/api/handwriting/regenerate-glyph", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -109,14 +116,9 @@ export function GenerateStep({
             char,
             existing_chars: existingChars,
           }),
-        });
-        if (!res.ok) {
-          const t = await res.text().catch(() => "");
-          throw new Error(t || `Regenerate failed (${res.status})`);
-        }
-        const data = (await res.json()) as RegenerateGlyphResponse;
-        setGallery((prev) =>
-          prev.map((g) =>
+        }, 90_000);
+        onGalleryChange(
+          gallery.map((g) =>
             g.char === data.char
               ? { ...g, image: data.image, source: "generated" }
               : g,
@@ -141,7 +143,7 @@ export function GenerateStep({
     setBuildError(null);
     try {
       const chars = gallery.map((g) => g.char);
-      const res = await fetch("/api/handwriting/build-font", {
+      const data = await apiRequest<BuildFontResponse>("/api/handwriting/build-font", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -150,11 +152,6 @@ export function GenerateStep({
           chars,
         }),
       });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(t || `Build failed (${res.status})`);
-      }
-      const data = (await res.json()) as BuildFontResponse;
       onFontBuilt(data);
     } catch (e) {
       setBuildError(e instanceof Error ? e.message : "Build failed.");
@@ -284,13 +281,13 @@ export function GenerateStep({
                   <Sparkles className="h-4 w-4" />
                 )}
                 {generating
-                  ? "Generating missing letters…"
+                  ? `Generating ${generationProgress.done} of ${generationProgress.total}…`
                   : "Generate missing letters with AI"}
               </Button>
               {generating && (
                 <p className="text-xs text-muted-foreground">
-                  Generating missing letters in your handwriting style… this
-                  can take a minute.
+                  Each sheet creates up to 12 letters together for a more
+                  consistent style. Finished sheets are saved immediately.
                 </p>
               )}
             </>

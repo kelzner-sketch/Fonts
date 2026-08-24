@@ -1,6 +1,11 @@
-# React App
+# Handwriting → Font AI
 
-A full-stack template with React + TypeScript + Tailwind CSS + shadcn/ui on the frontend and FastAPI on the backend.
+A React and FastAPI app that turns a handwriting sample into an editable,
+downloadable TrueType font.
+
+The workflow validates and normalizes phone photos, detects glyphs, lets the
+user correct the detected boxes, generates missing characters in resumable
+batches, and builds a local `.ttf` preview.
 
 ## Quick Start
 
@@ -30,6 +35,26 @@ This installs dependencies and starts both the Vite dev server (frontend) and th
 - Frontend: Edit `src/App.tsx` and files in `src/`
 - Backend API: Add routes in `routes.py`
 - The Vite dev server proxies `/api` requests to the FastAPI backend
+
+Set `GEMINI_WORKSHOP_API_KEY` (and `GEMINI_WORKSHOP_BASE_URL` when required by
+the environment) before using analysis or generation.
+
+## Reliability limits
+
+- Uploads accept PNG, JPG, and WebP up to 12 MB and 30 megapixels.
+- Images are orientation-corrected and reduced to a 2200 px analysis copy.
+- Missing glyphs are generated as ordered specimen sheets of up to 12
+  characters. This keeps stroke and proportion decisions coherent while local
+  grid extraction makes each cell independently retryable.
+- Provider and image-processing calls run outside the async web-server loop.
+
+## Checks
+
+```bash
+bun run build
+bun run lint
+uv run python -m unittest discover -s tests
+```
 
 ## Deploy
 

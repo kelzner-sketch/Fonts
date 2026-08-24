@@ -6,18 +6,19 @@ import base64
 import json
 import os
 import re
+import math
 
-from google import genai
-from google.genai import types
 from PIL import Image
 import io
 
-_client: genai.Client | None = None
+_client = None
 
 
-def _get_client() -> genai.Client:
+def _get_client():
     global _client
     if _client is None:
+        from google import genai
+
         _client = genai.Client(
             api_key=os.environ.get("GEMINI_WORKSHOP_API_KEY"),
             http_options={
@@ -49,6 +50,8 @@ Respond with ONLY a JSON object, no markdown fences, in this exact shape:
 
 
 def analyze_handwriting(image_bytes: bytes, mime_type: str = "image/png") -> dict:
+    from google.genai import types
+
     client = _get_client()
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
     response = client.models.generate_content(
@@ -97,6 +100,8 @@ Requirements:
 
 
 def generate_missing_glyph(char: str, style: str, reference_images: list[bytes]) -> bytes | None:
+    from google.genai import types
+
     client = _get_client()
     case_hint = "uppercase" if char.isupper() else ("a digit" if char.isdigit() else "lowercase")
     prompt = GENERATE_PROMPT_TEMPLATE.format(style=style or "natural handwriting", char=char, case_hint=case_hint)
@@ -117,4 +122,54 @@ def generate_missing_glyph(char: str, style: str, reference_images: list[bytes])
             if isinstance(data, str):
                 data = base64.b64decode(data)
             return data
+    return None
+
+
+def generate_glyph_sheet(
+    chars: list[str],
+    style: str,
+    reference_images: list[bytes],
+    columns: int = 4,
+) -> bytes | None:
+    """Generate an ordered atlas so a group of glyphs shares one coherent style."""
+    from google.genai import types
+
+    if not chars:
+        return None
+    rows = math.ceil(len(chars) / columns)
+    positions = ", ".join(
+        f"row {index // columns + 1} column {index % columns + 1} = {json.dumps(char)}"
+        for index, char in enumerate(chars)
+    )
+    prompt = f"""The reference images show characters from one person's handwriting.
+Style notes: {style or 'natural handwriting'}
+
+Create ONE clean specimen sheet containing exactly {len(chars)} handwritten glyphs
+in a fixed {rows}-row by {columns}-column grid. Match the reference stroke,
+slant, proportions, spacing, and ink color consistently across the whole sheet.
+
+Cell assignment: {positions}.
+
+Requirements:
+- Use equal-sized cells in the exact row-major order above.
+- Put one glyph only in each assigned cell; leave unused final cells empty.
+- Center every glyph with generous margin and a shared visual baseline.
+- Use a plain white background and no labels, captions, borders, or decoration.
+- Do not add or omit characters.
+"""
+    contents: list = [prompt]
+    for reference in reference_images[:6]:
+        try:
+            contents.append(Image.open(io.BytesIO(reference)))
+        except Exception:
+            continue
+    response = _get_client().models.generate_content(
+        model="gemini-2.5-flash-image",
+        contents=contents,
+        config=types.GenerateContentConfig(response_modalities=["IMAGE"]),
+    )
+    for part in response.parts or []:
+        if part.inline_data is not None:
+            data = part.inline_data.data
+            return base64.b64decode(data) if isinstance(data, str) else data
     return None
