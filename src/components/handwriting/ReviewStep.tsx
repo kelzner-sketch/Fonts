@@ -11,6 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import { apiRequest } from "@/lib/api";
 import {
   Select,
   SelectContent,
@@ -161,16 +162,14 @@ export function ReviewStep({
       const payload = boxes
         .filter((b) => b.char.length === 1)
         .map((b) => ({ char: b.char, bbox: b.bbox }));
-      const res = await fetch("/api/handwriting/confirm-glyphs", {
+      if (payload.length === 0) {
+        throw new Error("Label at least one glyph before continuing.");
+      }
+      const data = await apiRequest<ConfirmGlyphsResponse>("/api/handwriting/confirm-glyphs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId, glyphs: payload }),
       });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(t || `Confirm failed (${res.status})`);
-      }
-      const data = (await res.json()) as ConfirmGlyphsResponse;
       onConfirmed(
         data.glyphs.map((g) => ({ ...g, source: "confirmed" as const })),
       );

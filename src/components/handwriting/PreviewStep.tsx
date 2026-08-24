@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { apiRequest } from "@/lib/api";
 import { Textarea } from "@/components/ui/textarea";
 
 interface PreviewStepProps {
@@ -73,7 +74,7 @@ export function PreviewStep({
     setBuilding(true);
     setError(null);
     try {
-      const res = await fetch("/api/handwriting/build-font", {
+      const data = await apiRequest<BuildFontResponse>("/api/handwriting/build-font", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -82,11 +83,6 @@ export function PreviewStep({
           chars: galleryChars,
         }),
       });
-      if (!res.ok) {
-        const t = await res.text().catch(() => "");
-        throw new Error(t || `Build failed (${res.status})`);
-      }
-      const data = (await res.json()) as BuildFontResponse;
       onFontBuilt(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Build failed.");

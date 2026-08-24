@@ -1,16 +1,20 @@
 import base64
 import io
 import os
+import shutil
 
 from fastapi import FastAPI, APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
-from pydantic import BaseModel
+from PIL import ImageOps, UnidentifiedImageError
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
 
 import gemini_utils
 import session_store
 from font_builder import GlyphContours, build_ttf, image_to_font_contours
+from glyph_sheet import split_glyph_sheet
 
 CHARSETS = {
     "lowercase": [chr(c) for c in range(ord("a"), ord("z") + 1)],
@@ -23,6 +27,37 @@ CHARSETS = {
     ),
 }
 
+MAX_UPLOAD_BYTES = 12 * 1024 * 1024
+MAX_IMAGE_PIXELS = 30_000_000
+MAX_ANALYSIS_DIMENSION = 2200
+MAX_GENERATION_BATCH = 12
+
+
+def _open_upload(raw: bytes) -> Image.Image:
+    """Decode, orient, and bound an upload before it reaches storage or AI."""
+    try:
+        with Image.open(io.BytesIO(raw)) as source:
+            if source.width * source.height > MAX_IMAGE_PIXELS:
+                raise HTTPException(413, "Image dimensions are too large (30 megapixels maximum)")
+            image = ImageOps.exif_transpose(source).convert("RGB")
+    except HTTPException:
+        raise
+    except (UnidentifiedImageError, OSError, ValueError):
+        raise HTTPException(400, "Could not read this image. Try a PNG, JPG, or WebP file.")
+
+    image.thumbnail((MAX_ANALYSIS_DIMENSION, MAX_ANALYSIS_DIMENSION), Image.Resampling.LANCZOS)
+    return image
+
+
+def _api_error(operation: str, error: Exception) -> HTTPException:
+    # Avoid leaking provider keys, URLs, or raw response bodies to the browser.
+    status = getattr(error, "status_code", None)
+    if status == 429:
+        detail = f"{operation} is temporarily busy. Wait a moment and try again."
+    else:
+        detail = f"{operation} could not be completed. Please try again."
+    return HTTPException(502, detail)
+
 
 def create_app(static_dir: str) -> FastAPI:
     api = APIRouter()
@@ -33,22 +68,27 @@ def create_app(static_dir: str) -> FastAPI:
 
     @api.post("/handwriting/analyze")
     async def analyze_handwriting(file: UploadFile = File(...)):
-        raw = await file.read()
-        try:
-            img = Image.open(io.BytesIO(raw))
-            img = img.convert("RGB")
-        except Exception:
-            raise HTTPException(400, "Could not read image file")
+        if file.content_type and not file.content_type.startswith("image/"):
+            raise HTTPException(415, "Please upload an image file.")
+        raw = await file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Image is too large (12 MB maximum).")
+        if not raw:
+            raise HTTPException(400, "The uploaded file is empty.")
+        img = await run_in_threadpool(_open_upload, raw)
 
         session_id = session_store.new_session()
-        img.save(session_store.original_path(session_id), format="PNG")
+        await run_in_threadpool(img.save, session_store.original_path(session_id), "PNG", optimize=True)
 
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         try:
-            result = gemini_utils.analyze_handwriting(buf.getvalue(), "image/png")
-        except Exception as e:
-            raise HTTPException(502, f"Handwriting analysis failed: {e}")
+            result = await run_in_threadpool(
+                gemini_utils.analyze_handwriting, buf.getvalue(), "image/png"
+            )
+        except Exception as error:
+            shutil.rmtree(session_store.session_dir(session_id), ignore_errors=True)
+            raise _api_error("Handwriting analysis", error)
 
         return {
             "session_id": session_id,
@@ -60,7 +100,23 @@ def create_app(static_dir: str) -> FastAPI:
 
     class GlyphBox(BaseModel):
         char: str
-        bbox: list[float]
+        bbox: list[float] = Field(min_length=4, max_length=4)
+
+        @field_validator("char")
+        @classmethod
+        def valid_char(cls, value: str) -> str:
+            if len(value) != 1 or not value.isascii() or not value.isalnum():
+                raise ValueError("char must be one ASCII letter or digit")
+            return value
+
+        @field_validator("bbox")
+        @classmethod
+        def valid_bbox(cls, value: list[float]) -> list[float]:
+            if any(not 0 <= coordinate <= 1 for coordinate in value):
+                raise ValueError("bbox coordinates must be between 0 and 1")
+            if value[2] <= value[0] or value[3] <= value[1]:
+                raise ValueError("bbox must have positive width and height")
+            return value
 
     class ConfirmGlyphsRequest(BaseModel):
         session_id: str
@@ -90,7 +146,8 @@ def create_app(static_dir: str) -> FastAPI:
             if px1 <= px0 or py1 <= py0:
                 continue
             crop = img.crop((px0, py0, px1, py1))
-            crop.save(session_store.glyph_path(body.session_id, g.char), format="PNG")
+            crop.thumbnail((512, 512), Image.Resampling.LANCZOS)
+            crop.save(session_store.glyph_path(body.session_id, g.char), format="PNG", optimize=True)
             buf = io.BytesIO()
             crop.save(buf, format="PNG")
             results.append(
@@ -105,14 +162,24 @@ def create_app(static_dir: str) -> FastAPI:
         session_id: str
         existing_chars: list[str]
         charset: str = "lowercase"
+        requested_chars: list[str] | None = None
 
     @api.post("/handwriting/generate-missing")
     async def generate_missing(body: GenerateMissingRequest):
         if not session_store.session_exists(body.session_id):
             raise HTTPException(404, "Unknown session")
-        target = CHARSETS.get(body.charset, CHARSETS["lowercase"])
+        if body.charset not in CHARSETS:
+            raise HTTPException(400, "Unknown character set")
+        target = CHARSETS[body.charset]
         existing = set(body.existing_chars)
         missing = [c for c in target if c not in existing]
+        if body.requested_chars is not None:
+            requested = set(body.requested_chars)
+            missing = [c for c in missing if c in requested]
+        if len(missing) > MAX_GENERATION_BATCH:
+            raise HTTPException(
+                400, f"Generate at most {MAX_GENERATION_BATCH} glyphs per request"
+            )
 
         # gather reference crops already captured for style-matching
         ref_bytes = []
@@ -128,16 +195,29 @@ def create_app(static_dir: str) -> FastAPI:
         # generic note if not passed back by client (kept stateless here)
         style = "consistent with the reference handwriting samples provided"
 
+        if not missing:
+            return {"generated": [], "errors": []}
+
+        try:
+            sheet_bytes = await run_in_threadpool(
+                gemini_utils.generate_glyph_sheet, missing, style, ref_bytes
+            )
+        except Exception as error:
+            raise _api_error("Glyph generation", error)
+        if not sheet_bytes:
+            raise HTTPException(502, "The generator did not return a specimen sheet. Try again.")
+
+        extracted, rejected = await run_in_threadpool(
+            split_glyph_sheet, sheet_bytes, missing
+        )
         generated = []
-        errors = []
+        errors = [
+            {"char": char, "error": "The generated cell was blank or unusable; retry it."}
+            for char in rejected
+        ]
         for ch in missing:
-            try:
-                img_bytes = gemini_utils.generate_missing_glyph(ch, style, ref_bytes)
-            except Exception as e:
-                errors.append({"char": ch, "error": str(e)})
-                continue
+            img_bytes = extracted.get(ch)
             if not img_bytes:
-                errors.append({"char": ch, "error": "no image returned"})
                 continue
             with open(session_store.glyph_path(body.session_id, ch), "wb") as f:
                 f.write(img_bytes)
@@ -154,6 +234,13 @@ def create_app(static_dir: str) -> FastAPI:
         char: str
         existing_chars: list[str]
 
+        @field_validator("char")
+        @classmethod
+        def valid_char(cls, value: str) -> str:
+            if len(value) != 1 or not value.isascii() or not value.isalnum():
+                raise ValueError("char must be one ASCII letter or digit")
+            return value
+
     @api.post("/handwriting/regenerate-glyph")
     async def regenerate_glyph(body: RegenerateGlyphRequest):
         if not session_store.session_exists(body.session_id):
@@ -166,9 +253,15 @@ def create_app(static_dir: str) -> FastAPI:
                     ref_bytes.append(f.read())
         if not ref_bytes:
             raise HTTPException(400, "Need reference glyphs to match style against")
-        img_bytes = gemini_utils.generate_missing_glyph(
-            body.char, "consistent with the reference handwriting samples provided", ref_bytes
-        )
+        try:
+            img_bytes = await run_in_threadpool(
+                gemini_utils.generate_missing_glyph,
+                body.char,
+                "consistent with the reference handwriting samples provided",
+                ref_bytes,
+            )
+        except Exception as error:
+            raise _api_error("Glyph generation", error)
         if not img_bytes:
             raise HTTPException(502, "Generation failed")
         with open(session_store.glyph_path(body.session_id, body.char), "wb") as f:
@@ -197,7 +290,7 @@ def create_app(static_dir: str) -> FastAPI:
                 continue
             with open(p, "rb") as f:
                 data = f.read()
-            gc = image_to_font_contours(data, ch)
+            gc = await run_in_threadpool(image_to_font_contours, data, ch)
             if gc is None:
                 skipped.append(ch)
                 continue
@@ -209,9 +302,9 @@ def create_app(static_dir: str) -> FastAPI:
         safe_name = "".join(c for c in body.font_name if c.isalnum() or c in " -_") or "MyHandwriting"
         out_path = session_store.font_path(body.session_id)
         try:
-            build_ttf(glyphs, safe_name, out_path)
-        except Exception as e:
-            raise HTTPException(500, f"Font build failed: {e}")
+            await run_in_threadpool(build_ttf, glyphs, safe_name, out_path)
+        except Exception:
+            raise HTTPException(500, "Font build failed. Check the glyphs and try again.")
 
         return {
             "font_url": f"/api/handwriting/font/{body.session_id}",
